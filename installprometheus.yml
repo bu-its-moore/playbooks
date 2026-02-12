@@ -1,0 +1,42 @@
+---
+- name: Install Prometheus
+  hosts: nodeexporter
+  become: yes
+  tasks:
+    - name: Ensure the directory exists
+      file:
+        path: /etc/nodeexporter
+        state: directory
+        mode: '0755'
+    - name: install Node Exporter
+      ansible.builtin.unarchive:
+        src: https://github.com/prometheus/node_exporter/releases/download/v1.8.2/node_exporter-1.8.2.linux-amd64.tar.gz
+        dest: /etc/nodeexporter
+        remote_src: yes
+    - name: Create systemd service file
+      copy:
+        dest: /etc/systemd/system/nodexporter.service
+        content: |
+          [Unit]
+          Description=Node Exporter for Prometheus
+          After=network.target
+
+          [Service]
+          ExecStart=/etc/nodeexporter/node_exporter-1.8.2.linux-amd64/node_exporter
+          Restart=always
+          User=root
+          Group=root
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Reload systemd daemon
+      command: systemctl daemon-reload
+
+    - name: Enable and start the service
+      systemd:
+        name: nodexporter
+        enabled: yes
+        state: started
+
+

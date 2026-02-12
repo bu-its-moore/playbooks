@@ -1,0 +1,33 @@
+---
+- name: Sync Ansible Inventory to Prometheus Targets
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    # Where Prometheus looks for targets on the Panopticon server
+    target_file: "/home/admin/monitoring/targets/fleet.yml"
+
+  tasks:
+    - name: Generate targets.yml content
+      set_fact:
+        prometheus_targets: |
+          - targets:
+            {% for host in groups['all'] %}
+            - "{{ host }}:9100"
+            {% endfor %}
+            labels:
+              job: 'linux-fleet'
+
+    - name: Write the targets file
+      copy:
+        content: "{{ prometheus_targets }}"
+        dest: "{{ target_file }}"
+        mode: "0644"
+
+    # Optional: Reload Prometheus to pick up changes instantly
+    # (Though file_sd_configs usually picks it up automatically within 15s)
+    - name: Reload Prometheus Configuration
+      uri:
+        url: http://prometheus:9090/-/reload
+        method: POST
+        status_code: 200

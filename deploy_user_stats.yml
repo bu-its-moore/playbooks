@@ -1,0 +1,76 @@
+---
+- name: Deploy User Statistics Script & Patch Node Exporter
+  hosts: all
+  become: true
+  vars:
+    # Where to put the admin script
+    script_dest_dir: "/admin_scripts"
+    script_name: "collect_user_stats.sh"
+
+    # Where Node Exporter should look for metrics
+    textfile_dir: "/var/lib/node_exporter/textfile_collector"
+
+    # The exact service name (based on your 'nodexporter.service')
+    service_name: "nodexporter"
+    service_file_path: "/etc/systemd/system/nodexporter.service"
+
+  tasks:
+    # --- PHASE 1: SETUP FOLDERS ---
+    - name: Ensure admin scripts directory exists
+      ansible.builtin.file:
+        path: "{{ script_dest_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Ensure textfile collector directory exists
+      ansible.builtin.file:
+        path: "{{ textfile_dir }}"
+        state: directory
+        mode: "0755"
+        # Ownership: default to root since your service runs as root
+        owner: root
+        group: root
+
+    # --- PHASE 2: DEPLOY SCRIPT ---
+    - name: Copy collection script to target
+      ansible.builtin.copy:
+        src: "./{{ script_name }}"
+        dest: "{{ script_dest_dir }}/{{ script_name }}"
+        mode: "0755"
+        owner: root
+        group: root
+
+    # --- PHASE 3: PATCH SYSTEMD SERVICE ---
+    - name: Add textfile collector flag to systemd service
+      ansible.builtin.replace:
+        path: "{{ service_file_path }}"
+        # Regex explanation:
+        # ^(ExecStart=.*node_exporter) -> Captures the existing start command
+        # \s*$                         -> Matches end of line (ignoring whitespace)
+        # This prevents adding the flag twice if you run the playbook again.
+        regexp: '^(ExecStart=.*node_exporter)\s*$'
+        replace: '\1 --collector.textfile.directory={{ textfile_dir }}'
+      notify: Restart Node Exporter
+
+    # --- PHASE 4: TEST & SCHEDULE ---
+    - name: Run script once to populate initial data
+      ansible.builtin.command:
+        cmd: "{{ script_dest_dir }}/{{ script_name }}"
+      register: script_run
+      changed_when: true
+
+    - name: Schedule script to run every minute
+      ansible.builtin.cron:
+        name: "Collect User CPU/Mem Stats"
+        job: "{{ script_dest_dir }}/{{ script_name }}"
+        user: root
+        minute: "*"
+        state: present
+
+  handlers:
+    # This runs ONLY if the "Patch systemd" task changed the file
+    - name: Restart Node Exporter
+      ansible.builtin.systemd:
+        name: "{{ service_name }}"
+        state: restarted
+        daemon_reload: true

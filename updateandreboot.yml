@@ -1,0 +1,18 @@
+---
+ - name: updatereboot
+   hosts: updateandreboot
+   tasks:
+   - name: create pre-reboot services, volumes, and application logs
+     script: scripts/beforereboot.sh
+   - name: update the system
+     dnf:
+       name: "*"
+       state: latest
+   - name: reboot the machine
+     reboot:
+   - name: create post-reboot services, volumes, and application logs
+     script: scripts/afterreboot.sh
+     register: out
+   - debug: var=out.stdout_lines
+
+

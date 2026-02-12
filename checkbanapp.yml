@@ -1,0 +1,11 @@
+- hosts: banapp
+  tasks:
+    - name: Execute inline Bash commands
+      shell: |
+     #!/bin/bash
+     ls -1 /etc/systemd/system/tomcat-* | \
+    while read s; do
+       s1=$(basename $s)
+       sudo systemctl is-active --quiet --no-pager $s1 && \
+       ( echo "active service: $s1"; sudo systemctl --no-pager status $s1 )
+     done

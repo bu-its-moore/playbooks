@@ -3,62 +3,77 @@
   hosts: updateandreboot
   become: true
   
-  # Centralize your essential services regex here
   vars:
-    target_services: "postgres|listen|pmon|ora_|commvault|appworx|cbagent|apache|banner|banjob|autofs|gcstartup|httpd|oracle|jenkins|mysqld|badm|oni|rabbit|tomcat"
+    # A single regex string of the core application strings we care about
+    target_regex: 'postgres|listen|pmon|ora_|commvault|appworx|cbagent|apache|banner|banjob|autofs|gcstartup|httpd|oracle|jenkins|mysqld|badm|oni|rabbit|tomcat'
 
   tasks:
-    - name: Record pre-reboot system state
-      shell: |
-        echo -e "### Services \n" > /var/log/before_reboot_services.log
-        systemctl --type=service --state=enabled,running,active --no-pager | awk '{for (i=1; i<=NF; i++) {printf "%s ", $i; if ($i ~ /^(running)$/) break} print ""}' | grep -E "{{ target_services }}" | grep "running" | awk '{print "- " $0 }' | uniq | sort > /var/log/before_reboot_services.log
-        
-        echo -e "### Volumes \n" > /var/log/before_reboot_volumes.log
-        df -h | grep -v -E 'tmpfs|cgroup' | awk '{if (NR!=1) {print "- " $1 " => " $NF }}' | uniq | sort > /var/log/before_reboot_volumes.log
-        
-        echo -e "\n#### Essential Databases and Apps\n" > /var/log/before_reboot_apps.log
-        ps h -o user,cgroup,egroup,sgroup,cmd,priority -N -u root,gdm | awk '{print "- "$1": "$5}' | grep -E "{{ target_services }}" | uniq | sort > /var/log/before_reboot_apps.log
-      args:
-        executable: /bin/bash
-      changed_when: false
+    # ==========================================
+    # Phase 1: Pre-Reboot State Capture
+    # ==========================================
+    - name: Gather initial service facts
+      ansible.builtin.service_facts:
 
+    - name: Snapshot target services that are CURRENTLY running
+      ansible.builtin.set_fact:
+        # 1. Convert the services dict to a list
+        # 2. Keep only services where state == 'running'
+        # 3. Extract just the service name (key)
+        # 4. Keep only names that match our target_regex
+        pre_reboot_running: >-
+          {{
+            ansible_facts.services | dict2items 
+            | selectattr('value.state', 'equalto', 'running') 
+            | map(attribute='key') 
+            | select('search', target_regex) 
+            | list
+          }}
+
+    - name: Display the pre-reboot snapshot
+      ansible.builtin.debug:
+        msg: "Found {{ pre_reboot_running | length }} critical services running."
+        var: pre_reboot_running
+
+    # ==========================================
+    # Phase 2: Patch and Reboot
+    # ==========================================
     - name: Apply all available DNF updates
-      dnf:
+      ansible.builtin.dnf:
         name: "*"
         state: latest
         update_cache: yes
 
     - name: Reboot the machine and wait for initialization
-      reboot:
+      ansible.builtin.reboot:
         reboot_timeout: 600
-        # Wait 5 min after SSH returns before proceeding, giving Oracle/Banner time to start
-        post_reboot_delay: 300 
+        # Allow 60 seconds of breathing room for heavy Java/Oracle apps to bind to ports
+        post_reboot_delay: 60
 
-    - name: Record post-reboot state and calculate diffs
-      shell: |
-        echo -e "### Services \n" > /var/log/after_reboot_services.log
-        systemctl --type=service --state=enabled,running,active --no-pager | awk '{for (i=1; i<=NF; i++) {printf "%s ", $i; if ($i ~ /^(running)$/) break} print ""}' | grep -E "{{ target_services }}" | grep "running" | awk '{print "- " $0 }' | uniq | sort > /var/log/after_reboot_services.log
-        
-        echo -e "### Volumes \n" > /var/log/after_reboot_volumes.log
-        df -h | grep -v -E 'tmpfs|cgroup' | awk '{if (NR!=1) {print "- " $1 " => " $NF }}' | uniq | sort > /var/log/after_reboot_volumes.log
-        
-        echo -e "\n#### Essential Databases and Apps\n" > /var/log/after_reboot_apps.log
-        ps h -o user,cgroup,egroup,sgroup,cmd,priority -N -u root,gdm | awk '{print "- "$1": "$5}' | grep -E "{{ target_services }}" | uniq | sort > /var/log/after_reboot_apps.log
-        
-        echo "=== Service Discrepancies ==="
-        # The || true prevents the task from failing if diff finds a mismatch
-        diff /var/log/before_reboot_services.log /var/log/after_reboot_services.log || true
-        
-        echo "=== Volume Discrepancies ==="
-        diff /var/log/before_reboot_volumes.log /var/log/after_reboot_volumes.log || true
-        
-        echo "=== App/Database Discrepancies ==="
-        diff /var/log/before_reboot_apps.log /var/log/after_reboot_apps.log || true
-      args:
-        executable: /bin/bash
-      register: validation_output
-      changed_when: false
+    # ==========================================
+    # Phase 3: Post-Reboot Validation
+    # ==========================================
+    - name: Gather post-reboot service facts
+      ansible.builtin.service_facts:
 
-    - name: Display validation results
-      debug:
-        var: validation_output.stdout_lines
+    - name: Snapshot target services running AFTER reboot
+      ansible.builtin.set_fact:
+        post_reboot_running: >-
+          {{
+            ansible_facts.services | dict2items 
+            | selectattr('value.state', 'equalto', 'running') 
+            | map(attribute='key') 
+            | select('search', target_regex) 
+            | list
+          }}
+
+    - name: Calculate which services failed to recover
+      ansible.builtin.set_fact:
+        # The Jinja2 difference filter subtracts list B from list A
+        missing_services: "{{ pre_reboot_running | difference(post_reboot_running) }}"
+
+    - name: Assert that all previously running services have recovered
+      ansible.builtin.assert:
+        that:
+          - missing_services | length == 0
+        fail_msg: "CRITICAL PIPELINE FAILURE: The following services failed to start: {{ missing_services }}"
+        success_msg: "SUCCESS: All {{ pre_reboot_running | length }} critical services recovered successfully."

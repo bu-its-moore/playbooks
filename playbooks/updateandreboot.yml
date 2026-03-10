@@ -1,18 +1,64 @@
 ---
- - name: updatereboot
-   hosts: updateandreboot
-   tasks:
-   - name: create pre-reboot services, volumes, and application logs
-     script: scripts/beforereboot.sh
-   - name: update the system
-     dnf:
-       name: "*"
-       state: latest
-   - name: reboot the machine
-     reboot:
-   - name: create post-reboot services, volumes, and application logs
-     script: scripts/afterreboot.sh
-     register: out
-   - debug: var=out.stdout_lines
+- name: Enterprise System Update and Reboot Sequence
+  hosts: updateandreboot
+  become: true
+  
+  # Centralize your essential services regex here
+  vars:
+    target_services: "postgres|listen|pmon|ora_|commvault|appworx|cbagent|apache|banner|banjob|autofs|gcstartup|httpd|oracle|jenkins|mysqld|badm|oni|rabbit|tomcat"
 
+  tasks:
+    - name: Record pre-reboot system state
+      shell: |
+        echo -e "### Services \n" > /var/log/before_reboot_services.log
+        systemctl --type=service --state=enabled,running,active --no-pager | awk '{for (i=1; i<=NF; i++) {printf "%s ", $i; if ($i ~ /^(running)$/) break} print ""}' | grep -E "{{ target_services }}" | grep "running" | awk '{print "- " $0 }' | uniq | sort > /var/log/before_reboot_services.log
+        
+        echo -e "### Volumes \n" > /var/log/before_reboot_volumes.log
+        df -h | grep -v -E 'tmpfs|cgroup' | awk '{if (NR!=1) {print "- " $1 " => " $NF }}' | uniq | sort > /var/log/before_reboot_volumes.log
+        
+        echo -e "\n#### Essential Databases and Apps\n" > /var/log/before_reboot_apps.log
+        ps h -o user,cgroup,egroup,sgroup,cmd,priority -N -u root,gdm | awk '{print "- "$1": "$5}' | grep -E "{{ target_services }}" | uniq | sort > /var/log/before_reboot_apps.log
+      args:
+        executable: /bin/bash
+      changed_when: false
 
+    - name: Apply all available DNF updates
+      dnf:
+        name: "*"
+        state: latest
+        update_cache: yes
+
+    - name: Reboot the machine and wait for initialization
+      reboot:
+        reboot_timeout: 600
+        # Wait 5 min after SSH returns before proceeding, giving Oracle/Banner time to start
+        post_reboot_delay: 300 
+
+    - name: Record post-reboot state and calculate diffs
+      shell: |
+        echo -e "### Services \n" > /var/log/after_reboot_services.log
+        systemctl --type=service --state=enabled,running,active --no-pager | awk '{for (i=1; i<=NF; i++) {printf "%s ", $i; if ($i ~ /^(running)$/) break} print ""}' | grep -E "{{ target_services }}" | grep "running" | awk '{print "- " $0 }' | uniq | sort > /var/log/after_reboot_services.log
+        
+        echo -e "### Volumes \n" > /var/log/after_reboot_volumes.log
+        df -h | grep -v -E 'tmpfs|cgroup' | awk '{if (NR!=1) {print "- " $1 " => " $NF }}' | uniq | sort > /var/log/after_reboot_volumes.log
+        
+        echo -e "\n#### Essential Databases and Apps\n" > /var/log/after_reboot_apps.log
+        ps h -o user,cgroup,egroup,sgroup,cmd,priority -N -u root,gdm | awk '{print "- "$1": "$5}' | grep -E "{{ target_services }}" | uniq | sort > /var/log/after_reboot_apps.log
+        
+        echo "=== Service Discrepancies ==="
+        # The || true prevents the task from failing if diff finds a mismatch
+        diff /var/log/before_reboot_services.log /var/log/after_reboot_services.log || true
+        
+        echo "=== Volume Discrepancies ==="
+        diff /var/log/before_reboot_volumes.log /var/log/after_reboot_volumes.log || true
+        
+        echo "=== App/Database Discrepancies ==="
+        diff /var/log/before_reboot_apps.log /var/log/after_reboot_apps.log || true
+      args:
+        executable: /bin/bash
+      register: validation_output
+      changed_when: false
+
+    - name: Display validation results
+      debug:
+        var: validation_output.stdout_lines
